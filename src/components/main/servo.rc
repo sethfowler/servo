@@ -71,6 +71,7 @@ pub mod layout {
     pub mod inline;
     pub mod model;
     pub mod text;
+    pub mod util;
     mod aux;
 }
 
