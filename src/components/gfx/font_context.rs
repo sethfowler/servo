@@ -14,6 +14,59 @@ use platform::font_context::FontContextHandle;
 
 use azure::azure_hl::BackendType;
 use core::hashmap::HashMap;
+use core::io::println;
+
+// FIXME(seth): This probably should not live here.
+pub struct LRUCache<K, V> {
+    entries: ~[(K, V)],
+    cache_size: uint,
+}
+
+pub impl<K: Eq + Copy, V: Copy> LRUCache<K, V> {
+    fn new(cache_size: uint) -> LRUCache<K, V> {
+        LRUCache {
+          entries: ~[],
+          cache_size: cache_size,
+        }
+    }
+
+    fn lookup(&mut self, key: &K) -> Option<V> {
+        match self.entries.position(|&(k, _)| k == *key) {
+            Some(pos) => Some(self.touch(pos)),
+            None      => None,
+        }
+    }
+
+    // FIXME(seth): I'm told this won't work til we update rust. Making insert public
+    // for now.
+    fn lookup_or_insert(&mut self, key: &K, f: &fn(&K) -> V) -> V {
+        match self.entries.position(|&(k, _)| k == *key) {
+            Some(pos) => self.touch(pos),
+            None      => self.insert(key, f(key)),
+        }
+    }
+
+    fn insert(&mut self, key: &K, val: V) -> V {
+        // There's been a cache miss. Insert the new value into the cache.
+        println("FONT GROUP CACHE MISS");
+        if self.entries.len() == self.cache_size {
+            self.entries.remove(0);
+        }
+        self.entries.push((*key, copy val));
+        val
+    }
+
+    priv fn touch(&mut self, pos: uint) -> V {
+        // There's been a cache hit. Update the value's position.
+        println("FONT GROUP CACHE HIT");
+        let (key, val) = copy self.entries[pos];
+        if pos != self.cache_size {
+            self.entries.remove(pos);
+            self.entries.push((key, copy val));
+        }
+        val
+    }
+}
 
 // TODO(Rust #3934): creating lots of new dummy styles is a workaround
 // for not being able to store symbolic enums in top-level constants.
@@ -37,6 +90,7 @@ pub trait FontContextHandleMethods {
 pub struct FontContext {
     instance_cache: MonoCache<FontDescriptor, @mut Font>,
     font_list: Option<FontList>, // only needed by layout
+    font_groups: LRUCache<SpecifiedFontStyle, @FontGroup>,
     handle: FontContextHandle,
     backend: BackendType,
     generic_fonts: HashMap<~str,~str>,
@@ -67,6 +121,7 @@ pub impl<'self> FontContext {
             instance_cache:
                 Cache::new::<FontDescriptor,@mut Font,MonoCache<FontDescriptor,@mut Font>>(10),
             font_list: font_list,
+            font_groups: LRUCache::new(5),
             handle: handle,
             backend: backend,
             generic_fonts: generic_fonts,
@@ -78,9 +133,17 @@ pub impl<'self> FontContext {
         self.font_list.get_ref()
     }
 
-    fn get_resolved_font_for_style(@mut self, style: &SpecifiedFontStyle) -> @FontGroup {
-        // TODO(Issue #178, E): implement a cache of FontGroup instances.
-        self.create_font_group(style)
+    fn get_resolved_font_for_style(&mut self, style: &SpecifiedFontStyle) -> @FontGroup {
+        match self.font_groups.lookup(style) {
+            Some(fg) => fg,
+            None => {
+                let fg = self.create_font_group(style);
+                self.font_groups.insert(style, fg)
+            }
+        }
+        // FIXME(seth): Once lookup_or_insert works, (i.e. once rustc is
+        // updated) we should use it.
+        //self.font_groups.lookup_or_insert(style, |s| self.create_font_group(s))
     }
 
     fn get_font_by_descriptor(&mut self, desc: &FontDescriptor) -> Result<@mut Font, ()> {
@@ -109,7 +172,7 @@ pub impl<'self> FontContext {
     }
 
     // TODO:(Issue #196): cache font groups on the font context.
-    priv fn create_font_group(@mut self, style: &SpecifiedFontStyle) -> @FontGroup {
+    priv fn create_font_group(&mut self, style: &SpecifiedFontStyle) -> @FontGroup {
         let mut fonts = ~[];
 
         debug!("(create font group) --- starting ---");
