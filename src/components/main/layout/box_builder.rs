@@ -4,16 +4,20 @@
 
 //! Creates CSS boxes from a DOM tree.
 
+use gfx::text::text_run::TextRun;
+use gfx::text::util::*;
 use layout::aux::LayoutAuxMethods;
 use layout::block::BlockFlowData;
 use layout::box::{GenericRenderBoxClass, ImageRenderBox, ImageRenderBoxClass, RenderBox};
 use layout::box::{RenderBoxBase, RenderBoxType, RenderBox_Generic, RenderBox_Image};
-use layout::box::{RenderBox_Text, UnscannedTextRenderBox, UnscannedTextRenderBoxClass};
+use layout::box::{RenderBox_Text, UnscannedTextRenderBox, TextRenderBoxClass, UnscannedTextRenderBoxClass};
 use layout::context::LayoutContext;
 use layout::flow::{AbsoluteFlow, BlockFlow, FloatFlow, Flow_Absolute, Flow_Block, Flow_Float};
 use layout::flow::{Flow_Inline, Flow_InlineBlock, Flow_Root, Flow_Table, FlowContext};
 use layout::flow::{FlowContextType, FlowData, InlineBlockFlow, InlineFlow, TableFlow};
 use layout::inline::{InlineFlowData, InlineLayout};
+use layout::text::{adapt_textbox_with_range, UnscannedMethods};
+use layout::util::{NodeRange};
 use css::node_style::StyledNode;
 
 use newcss::values::{CSSDisplay, CSSDisplayBlock, CSSDisplayInline, CSSDisplayInlineBlock};
@@ -22,11 +26,220 @@ use newcss::values::{CSSDisplayTableRowGroup, CSSDisplayTableHeaderGroup, CSSDis
 use newcss::values::{CSSDisplayTableRow, CSSDisplayTableColumnGroup, CSSDisplayTableColumn};
 use newcss::values::{CSSDisplayTableCell, CSSDisplayTableCaption};
 use newcss::values::{CSSDisplayNone};
+use newcss::values::{CSSTextDecoration, CSSTextDecorationUnderline};
 use script::dom::element::*;
 use script::dom::node::{AbstractNode, CommentNodeTypeId, DoctypeNodeTypeId};
 use script::dom::node::{ElementNodeTypeId, LayoutView, TextNodeTypeId};
 use servo_util::range::Range;
 use servo_util::tree::{TreeNodeRef, TreeUtils};
+
+//------ ****
+/// A stack-allocated object for scanning an inline flow into `TextRun`-containing `TextBox`es.
+struct TextRunScanner {
+    clump: Range,
+}
+
+impl TextRunScanner {
+    fn new() -> TextRunScanner {
+        TextRunScanner {
+            clump: Range::empty(),
+        }
+    }
+}
+
+impl TextRunScanner {
+    fn scan_for_runs(&mut self, ctx: &LayoutContext, flow: FlowContext) {
+        let inline = flow.inline();
+        assert!(inline.boxes.len() > 0);
+        debug!("TextRunScanner: scanning %u boxes for text runs...", inline.boxes.len());
+
+        let mut out_boxes = ~[];
+        for uint::range(0, flow.inline().boxes.len()) |box_i| {
+            debug!("TextRunScanner: considering box: %?", flow.inline().boxes[box_i].debug_str());
+            if box_i > 0 && !can_coalesce_text_nodes(flow.inline().boxes, box_i-1, box_i) {
+                self.flush_clump_to_list(ctx, flow, &mut out_boxes);
+            }
+            self.clump.extend_by(1);
+        }
+        // handle remaining clumps
+        if self.clump.length() > 0 {
+            self.flush_clump_to_list(ctx, flow, &mut out_boxes);
+        }
+
+        debug!("TextRunScanner: swapping out boxes.");
+
+        // Swap out the old and new box list of the flow.
+        flow.inline().boxes = out_boxes;
+
+        // A helper function.
+        fn can_coalesce_text_nodes(boxes: &[RenderBox], left_i: uint, right_i: uint) -> bool {
+            assert!(left_i < boxes.len());
+            assert!(right_i > 0 && right_i < boxes.len());
+            assert!(left_i != right_i);
+
+            let (left, right) = (boxes[left_i], boxes[right_i]);
+            match (left, right) {
+                (UnscannedTextRenderBoxClass(*), UnscannedTextRenderBoxClass(*)) => {
+                    left.can_merge_with_box(right)
+                }
+                (_, _) => false
+            }
+        }
+    }
+
+    /// A "clump" is a range of inline flow leaves that can be merged together into a single
+    /// `RenderBox`. Adjacent text with the same style can be merged, and nothing else can.
+    ///
+    /// The flow keeps track of the `RenderBox`es contained by all non-leaf DOM nodes. This is
+    /// necessary for correct painting order. Since we compress several leaf `RenderBox`es here,
+    /// the mapping must be adjusted.
+    ///
+    /// N.B. `in_boxes` is passed by reference, since the old code used a `DVec`. The caller is
+    /// responsible for swapping out the list. It is not clear to me (pcwalton) that this is still
+    /// necessary.
+    fn flush_clump_to_list(&mut self,
+                           ctx: &LayoutContext,
+                           flow: FlowContext,
+                           out_boxes: &mut ~[RenderBox]) {
+        let inline = &mut *flow.inline();
+        let in_boxes = &inline.boxes;
+
+        fn has_underline(decoration: CSSTextDecoration) -> bool{
+            match decoration {
+                CSSTextDecorationUnderline => true,
+                _ => false
+            }
+        }
+
+        assert!(self.clump.length() > 0);
+
+        debug!("TextRunScanner: flushing boxes in range=%?", self.clump);
+        let is_singleton = self.clump.length() == 1;
+        let is_text_clump = match in_boxes[self.clump.begin()] {
+            UnscannedTextRenderBoxClass(*) => true,
+            _ => false
+        };
+
+        match (is_singleton, is_text_clump) {
+            (false, false) => {
+                fail!(~"WAT: can't coalesce non-text nodes in flush_clump_to_list()!")
+            }
+            (true, false) => {
+                debug!("TextRunScanner: pushing single non-text box in range: %?", self.clump);
+                out_boxes.push(in_boxes[self.clump.begin()]);
+            },
+            (true, true)  => {
+                let old_box = in_boxes[self.clump.begin()];
+                let text = old_box.raw_text();
+                let font_style = old_box.font_style();
+                let underline = has_underline(old_box.text_decoration());
+
+                // TODO(#115): Use the actual CSS `white-space` property of the relevant style.
+                let compression = CompressWhitespaceNewline;
+
+                let transformed_text = transform_text(text, compression);
+
+                // TODO(#177): Text run creation must account for the renderability of text by
+                // font group fonts. This is probably achieved by creating the font group above
+                // and then letting `FontGroup` decide which `Font` to stick into the text run.
+                let fontgroup = ctx.font_ctx.get_resolved_font_for_style(&font_style);
+                let run = @fontgroup.create_textrun(transformed_text, underline);
+
+                debug!("TextRunScanner: pushing single text box in range: %?", self.clump);
+                let new_box = do old_box.with_base |old_box_base| {
+                    let range = Range::new(0, run.char_len());
+                    @mut adapt_textbox_with_range(*old_box_base, run, range)
+                };
+
+                out_boxes.push(TextRenderBoxClass(new_box));
+            },
+            (false, true) => {
+                // TODO(#115): Use the actual CSS `white-space` property of the relevant style.
+                let compression = CompressWhitespaceNewline;
+
+                // First, transform/compress text of all the nodes.
+                let transformed_strs: ~[~str] = do vec::from_fn(self.clump.length()) |i| {
+                    // TODO(#113): We should be passing the compression context between calls to
+                    // `transform_text`, so that boxes starting and/or ending with whitespace can
+                    // be compressed correctly with respect to the text run.
+                    let idx = i + self.clump.begin();
+                    transform_text(in_boxes[idx].raw_text(), compression)
+                };
+
+                // Next, concatenate all of the transformed strings together, saving the new
+                // character indices.
+                let mut run_str: ~str = ~"";
+                let mut new_ranges: ~[Range] = ~[];
+                let mut char_total = 0;
+                for uint::range(0, transformed_strs.len()) |i| {
+                    let added_chars = str::char_len(transformed_strs[i]);
+                    new_ranges.push(Range::new(char_total, added_chars));
+                    str::push_str(&mut run_str, transformed_strs[i]);
+                    char_total += added_chars;
+                }
+
+                // Now create the run.
+                //
+                // TODO(#177): Text run creation must account for the renderability of text by
+                // font group fonts. This is probably achieved by creating the font group above
+                // and then letting `FontGroup` decide which `Font` to stick into the text run.
+                let font_style = in_boxes[self.clump.begin()].font_style();
+                let fontgroup = ctx.font_ctx.get_resolved_font_for_style(&font_style);
+                let underline = has_underline(in_boxes[self.clump.begin()].text_decoration());
+
+                // TextRuns contain a cycle which is usually resolved by the teardown
+                // sequence. If no clump takes ownership, however, it will leak.
+                let clump = self.clump;
+                let run = if clump.length() != 0 {
+                    Some(@TextRun::new(fontgroup.fonts[0], run_str, underline))
+                } else {
+                    None
+                };
+
+                // Make new boxes with the run and adjusted text indices.
+                debug!("TextRunScanner: pushing box(es) in range: %?", self.clump);
+                for clump.eachi |i| {
+                    let range = new_ranges[i - self.clump.begin()];
+                    if range.length() == 0 {
+                        error!("Elided an `UnscannedTextbox` because it was zero-length after \
+                                compression; %s",
+                               in_boxes[i].debug_str());
+                        loop
+                    }
+
+                    do in_boxes[i].with_base |base| {
+                        let new_box = @mut adapt_textbox_with_range(*base, run.get(), range);
+                        out_boxes.push(TextRenderBoxClass(new_box));
+                    }
+                }
+            }
+        } // End of match.
+
+        debug!("--- In boxes: ---");
+        for in_boxes.eachi |i, box| {
+            debug!("%u --> %s", i, box.debug_str());
+        }
+        debug!("------------------");
+
+        debug!("--- Out boxes: ---");
+        for out_boxes.eachi |i, box| {
+            debug!("%u --> %s", i, box.debug_str());
+        }
+        debug!("------------------");
+
+        debug!("--- Elem ranges: ---");
+        for inline.elems.eachi_mut |i: uint, nr: &NodeRange| {
+            debug!("%u: %? --> %s", i, nr.range, nr.node.debug_str()); ()
+        }
+        debug!("--------------------");
+
+        let end = self.clump.end(); // FIXME: borrow checker workaround
+        self.clump.reset(end, 0);
+    } // End of `flush_clump_to_list`.
+}
+
+
+// ------ ****
 
 pub struct LayoutTreeBuilder {
     root_flow: Option<FlowContext>,
@@ -424,7 +637,7 @@ pub impl LayoutTreeBuilder {
     ///
     /// The latter can only be done immediately adjacent to, or at the beginning or end of a block
     /// flow. Otherwise, the whitespace might affect whitespace collapsing with adjacent text.
-    fn simplify_children_of_flow(&self, _: &LayoutContext, parent_flow: &mut FlowContext) {
+    fn simplify_children_of_flow(&self, ctx: &LayoutContext, parent_flow: &mut FlowContext) {
         match *parent_flow {
             InlineFlow(*) => {
                 let mut found_child_inline = false;
@@ -442,6 +655,9 @@ pub impl LayoutTreeBuilder {
                 if found_child_block && found_child_inline {
                     self.fixup_split_inline(*parent_flow)
                 }
+
+                let mut scanner = TextRunScanner::new();
+                scanner.scan_for_runs(ctx, flow);
             },
             BlockFlow(*) => {
                 // FIXME: this will create refcounted cycles between the removed flow and any
