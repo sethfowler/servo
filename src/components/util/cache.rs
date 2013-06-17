@@ -13,7 +13,7 @@ pub struct MonoCache<K, V> {
     entry: Option<(K,V)>,
 }
 
-impl<K: Copy + Eq, V: Copy> MonoCache<K,V> {
+pub impl<K: Copy + Eq, V: Copy> MonoCache<K,V> {
     fn new(_size: uint) -> MonoCache<K,V> {
         MonoCache { entry: None }
     }
@@ -66,7 +66,7 @@ pub struct LRUCache<K, V> {
     cache_size: uint,
 }
 
-impl<K: Copy + Eq, V: Copy> LRUCache<K,V> {
+pub impl<K: Copy + Eq, V: Copy> LRUCache<K,V> {
     fn new(size: uint) -> LRUCache<K, V> {
         LRUCache {
           entries: ~[],
@@ -75,8 +75,6 @@ impl<K: Copy + Eq, V: Copy> LRUCache<K,V> {
     }
 
     fn touch(&mut self, pos: uint) -> V {
-        // There's been a cache hit. Update the value's position.
-        println("FONT GROUP CACHE HIT");
         let (key, val) = copy self.entries[pos];
         if pos != self.cache_size {
             self.entries.remove(pos);
@@ -88,8 +86,6 @@ impl<K: Copy + Eq, V: Copy> LRUCache<K,V> {
 
 impl<K: Copy + Eq, V: Copy> Cache<K,V> for LRUCache<K,V> {
     fn insert(&mut self, key: &K, val: V) {
-        // There's been a cache miss. Insert the new value into the cache.
-        println("FONT GROUP CACHE MISS");
         if self.entries.len() == self.cache_size {
             self.entries.remove(0);
         }
